@@ -1,5 +1,10 @@
 #!/usr/bin/perl
 
+# proto1.pl reaches a performance of about 17 k ticks/second
+# this version emits a compiled loop body - hopefully faster!
+# the first revision that kept loops in the body but inlined the four subs
+#   had a loop speed of about 29 k ticks/second, but a overall speed of 6 k
+
 use 5.024;
 use strict;
 use warnings;
@@ -8,6 +13,7 @@ use Sys::Hostname qw(hostname);
 use Cwd qw(getcwd);
 use String::ShellQuote qw(shell_quote_best_effort);
 use Carp qw(croak);
+use B::Concise ();
 
 my $ST;
 BEGIN { $ST = time }
@@ -28,6 +34,7 @@ print <<'END';
 | |___| |_| | || |\  | | |_) | | | (_) | || (_) | | |
 |_____|____/___|_| \_| | .__/|_|  \___/ \__\___/  |_|
                        |_|                           
+		 comp_pl version!
 END
 say scalar(localtime);
 say shell_quote_best_effort(hostname(), getcwd(), "$0");
@@ -231,11 +238,7 @@ our $max_tpd;
 # TODO: yeah, but should be examinable externally?
 # TODO: add "probe" latches - these have a .in wired to some other signal, but no .out needed
 our %latches;
-## new inputs to latches
-#our %inputs;
-# XXX new inputs to latches are found on wiring
-# values on the wires
-our %wiring;
+# new inputs to latches are found on wiring
 
 # fill in initial values for the latches in the state hash (%latches)
 # clear inputs
@@ -264,52 +267,111 @@ sub dump_state {
   return;
 }
 
-# Simulator step code
-sub setup_wiring {
-  %wiring = ();
-  return;
-}
-
-sub apply_nets {
-  my ($driver_name, $value) = @_;
-  for my $driven_name (keys %{$nets{$driver_name}}) {
-    my $net = $nets{$driver_name}{$driven_name};
-    my $sub_value = ($value & $net->{driver_mask}) >> $net->{driver_shift};
-    $wiring{$driven_name} //= 0;
-    die if $wiring{$driven_name} & $net->{driven_mask};
-    $wiring{$driven_name} |= $sub_value << $net->{driven_shift};
-  }
-  return;
-}
-
-sub latches_to_wires {
-  for my $name (sort keys %registers) {
-    apply_nets($name . ".out", $latches{$name} & $registers{$name}{mask});
-  }
-  return;
-}
-
-sub run_wiring {
-  for my $logic_name (@logics_order) {
-    my $input = $wiring{$logic_name . ".in"};
-    $input //= 0; # XXX because of zero
-    my $output = run_logic($logic_name, $input);
-    apply_nets($logic_name . ".out", $output);
-  }
-  return;
-}
-
-sub set_latches {
-  for my $name (sort keys %registers) {
-    $latches{$name} = $wiring{$name . ".in"} & $registers{$name}{mask};
-  }
-}
-
 sub read_latch {
   my ($name) = @_;
   die unless defined $registers{$name};
   die if $latches{$name} & ~$registers{$name}{mask};
   return $latches{$name} & $registers{$name}{mask};
+}
+
+# Simulator step code
+sub gen_setup_wiring {
+  return <<'END';
+    my %wiring = ();
+END
+}
+
+sub gen_apply_nets_prologue {
+  return <<'END';
+    my $apply_nets = sub {
+      my ($driver_name, $value) = @_;
+      for my $driven_name (keys %{$nets{$driver_name}}) {
+        my $net = $nets{$driver_name}{$driven_name};
+        my $sub_value = ($value & $net->{driver_mask}) >> $net->{driver_shift};
+        $wiring{$driven_name} //= 0;
+        die if $wiring{$driven_name} & $net->{driven_mask};
+        $wiring{$driven_name} |= $sub_value << $net->{driven_shift};
+      }
+      return;
+    };
+END
+}
+
+sub gen_latches_to_wires {
+  return <<'END';
+    for my $name (sort keys %registers) {
+      $apply_nets->($name . ".out", $latches{$name} & $registers{$name}{mask});
+    }
+END
+}
+
+sub gen_run_wiring {
+  return <<'END';
+    for my $logic_name (@logics_order) {
+      my $input = $wiring{$logic_name . ".in"};
+      if ($logics{$logic_name}{in_bits} == 0) {
+        $input = 0;
+      }
+      my $output = run_logic($logic_name, $input);
+      $apply_nets->($logic_name . ".out", $output);
+    }
+END
+}
+
+sub gen_set_latches {
+  return <<'END';
+    for my $name (sort keys %registers) {
+      $latches{$name} = $wiring{$name . ".in"} & $registers{$name}{mask};
+    }
+END
+}
+
+our $simulator;
+sub generate_simulator {
+  my %blocks = (
+    setup_wiring => \&gen_setup_wiring,
+    apply_nets_prologue => \&gen_apply_nets_prologue,
+    latches_to_wires => \&gen_latches_to_wires,
+    run_wiring => \&gen_run_wiring,
+    set_latches => \&gen_set_latches,
+  );
+  my $template = <<'END';
+    sub {
+      use integer;
+
+      # setup wiring for this simulation step
+      @@@setup_wiring@@@
+      @@@apply_nets_prologue@@@
+
+      # copy latch values into latch.out signals
+      @@@latches_to_wires@@@
+
+      # use topo order to evaluate logic blocks
+      @@@run_wiring@@@
+
+      # copy latch.in signals into latch state
+      $t++;
+      @@@set_latches@@@
+    }
+END
+
+  # XXX magic to fix up indentation to copy indent of first line
+  $template =~ s{@@@([^@]+)@@@}{($blocks{$1} // sub { die "gen $1" })->()}ge;
+
+  timed_log "Template for simulator";
+  print $template;
+
+  local $@;
+  my $rv = eval $template;
+  if (not $rv) {
+    die $@;
+  }
+  $simulator = $rv;
+
+  timed_log "Dump of simulator";
+  B::Concise::compile("-exec", $simulator)->();
+
+  return;
 }
 
 # This is intended to just simulate an 8-bit ALU implemented with a pair of LUTs and fast-carry logic
@@ -369,6 +431,9 @@ timed_log "Logics sorted as: ", join(", ", @logics_order);
 generate_luts();
 timed_log "Generated LUTs";
 
+generate_simulator();
+timed_log "Generated simulator";
+
 # The simulation procedes as follows
 # Time 0 is the initial "random" state of the gates
 # Then we loop over the ticks and the tick is numbered on the gates being set at the end.
@@ -395,23 +460,13 @@ reset_latch("P", 1);
 reset_latch("Q", 1);
 reset_latch("R", 1);
 
+my $st_loop = time;
 die unless $t == 0;
 dump_state();
 while ($t < 100) {
   local $max_tpd = 0;
   
-  # setup wiring for this simulation step
-  setup_wiring();
-
-  # copy latch values into latch.out signals
-  latches_to_wires();
-
-  # use topo order to evaluate logic blocks
-  run_wiring();
-
-  # copy latch.in signals into latch state
-  $t++;
-  set_latches();
+  $simulator->();
   
   dump_state();
 
@@ -446,6 +501,7 @@ sub num2human {
 }
 
 my $et = time;
-timed_log sprintf "t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $ST), num2human($t / ($et - $ST));
+timed_log sprintf "loop  t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $st_loop), num2human($t / ($et - $st_loop));
+timed_log sprintf "total t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $ST), num2human($t / ($et - $ST));
 
 timed_log "End of run\n";
