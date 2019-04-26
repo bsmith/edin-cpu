@@ -7,6 +7,8 @@
 #   had a loop speed of about 29 k ticks/second, but an overall speed of 6 k
 # second revision with logics and latches loops removed, but apply_nets kept
 #   had a loop speed of about 35 k ticks/second, but an overall speed of 3 k
+# third revision with lexical wiring vars and 256 iterations
+#   had a loop speed of about 125 k ticks/second, but an overall speed of 6.5 k
 
 use 5.024;
 use strict;
@@ -278,39 +280,84 @@ sub read_latch {
   return $latches{$name} & $registers{$name}{mask};
 }
 
-# Simulator step code
-sub gen_setup_wiring {
-  return <<'END';
-    my %wiring = ();
-END
+# Simulator step generator code
+
+our %vars;
+our %wiring_vars;
+our $uniq_gen = 0;
+sub reset_generator {
+  %vars = ();
+  %wiring_vars = ();
+  $uniq_gen = 0;
 }
 
-sub gen_apply_nets_prologue {
-  return <<'END';
-    my $apply_nets = sub {
-      my ($driver_name, $value) = @_;
-      for my $driven_name (keys %{$nets{$driver_name}}) {
-        my $net = $nets{$driver_name}{$driven_name};
-        my $sub_value = ($value & $net->{driver_mask}) >> $net->{driver_shift};
-        $wiring{$driven_name} //= 0;
-        die if $wiring{$driven_name} & $net->{driven_mask};
-        $wiring{$driven_name} |= $sub_value << $net->{driven_shift};
-      }
-      return;
-    };
+sub get_var {
+  my ($id) = @_;
+  $id =~ s/[^a-zA-Z0-9]/_/g;
+  $id = '_' . $id if $id =~ /^[0-9]/;
+  if (defined $vars{$id}) {
+    $id .= $uniq_gen++;
+    die if defined $vars{$id};
+  }
+  $vars{$id} = $_[0];
+  return $id;
+}
+
+sub gen_setup_wiring {
+  my %driven_wires;
+  for my $driver_name (keys %nets) {
+    for my $driven_name (keys %{$nets{$driver_name}}) {
+      $driven_wires{$driven_name}++;
+    }
+  }
+  
+  my $code = '';
+  for my $driven_name (sort keys %driven_wires) {
+    my $varname = $wiring_vars{$driven_name} = '$' . get_var($driven_name);
+    $code .= 'my ' . $varname . " = 0;\n";
+  }
+  return $code;
+}
+
+sub gen_apply_nets {
+  my ($driver_name, $value) = @_;
+  my $code = '';
+
+  $code .= sprintf "# %s driving %s\n",
+    $driver_name, join(", ", sort keys %{$nets{$driver_name}});
+
+  # TODO: instead of the die below, properly track which bits are driven
+  # this allows checking we're not driving anything twice
+  # then for logic inputs we can check they're driven
+  # only really important after OE is implemented for 3-state logic since
+  # without that, you can statically check this
+  # TODO: that would be a good optimisation: only runtime check 3-state buses
+
+  for my $driven_name (sort keys %{$nets{$driver_name}}) {
+    my $net = $nets{$driver_name}{$driven_name};
+    my $template = <<'END';
+#      die if !!!wiring_driven!!! & !!!driven_mask!!!;
+      !!!wiring_driven!!! |= ((!!!value!!!) & !!!driver_mask!!!) >> !!!driver_shift!!! << !!!driven_shift!!!;
 END
+    $template =~ s{!!!wiring_driven!!!}{$wiring_vars{$driven_name}}ge;
+    $template =~ s{!!!driver_mask!!!}{sprintf "0x%08x", $net->{driver_mask}}ge;
+    $template =~ s{!!!driver_shift!!!}{$net->{driver_shift}}ge;
+    $template =~ s{!!!driven_mask!!!}{sprintf "0x%08x", $net->{driven_mask}}ge;
+    $template =~ s{!!!driven_shift!!!}{$net->{driven_shift}}ge;
+    $template =~ s{!!!value!!!}{$value}ge;
+    $code .= $template;
+  }
+
+  return $code;
 }
 
 sub gen_latches_to_wires {
   my $code;
   for my $name (sort keys %registers) {
-    my $template = <<'END';
-      $apply_nets->(!!!name_out!!!, $latches{!!!name!!!} & !!!mask!!!);
-END
-    $template =~ s{!!!name!!!}{'"' . quotemeta($name) . '"'}ge;
-    $template =~ s{!!!name_out!!!}{'"' . quotemeta($name . ".out") . '"'}ge;
-    $template =~ s{!!!mask!!!}{sprintf "0x%08x", $registers{$name}{mask}}ge;
-    $code .= $template;
+    my $value_template = q{ $latches{!!!name!!!} & !!!mask!!! };
+    $value_template =~ s{!!!name!!!}{'"' . quotemeta($name) . '"'}ge;
+    $value_template =~ s{!!!mask!!!}{sprintf "0x%08x", $registers{$name}{mask}}ge;
+    $code .= gen_apply_nets($name . ".out", $value_template);
   }
   return $code;
 }
@@ -319,19 +366,30 @@ sub gen_run_wiring {
   my $code;
   for my $logic_name (@logics_order) {
     my $template = '';
-    if ($logics{$logic_name}{in_bits} == 0) {
-      $template .= q{ my $input = 0; } . "\n";
+    my $output_var = '$' . get_var($logic_name . '_output');
+    if (defined $LUTs{$logic_name}) {
+      if ($logics{$logic_name}{in_bits} == 0) {
+#	$template .= 'my !!!output_var!!! = ' . $LUTs{$logic_name}[0] . ";\n";
+	$output_var = $LUTs{$logic_name}[0];
+      } else {
+	$template .= 'my !!!output_var!!! = $LUTs{!!!logic_name!!!}[!!!wiring_in!!!];' . "\n";
+      }
     } else {
-      $template .= q{ my $input = $wiring{!!!name_in!!!}; } . "\n";
-    }
-    $template .= <<'END';
-      my $output = run_logic(!!!name!!!, $input);
-      $apply_nets->(!!!name_out!!!, $output);
+      if ($logics{$logic_name}{in_bits} == 0) {
+        $template .= <<'END';
+          my !!!output_var!!! = run_logic(!!!logic_name!!!, 0);
 END
-    $template =~ s{!!!name!!!}{'"' . quotemeta($logic_name) . '"'}ge;
-    $template =~ s{!!!name_in!!!}{'"' . quotemeta($logic_name . ".in") . '"'}ge;
-    $template =~ s{!!!name_out!!!}{'"' . quotemeta($logic_name . ".out") . '"'}ge;
-    $code .= "{\n" . $template . "}\n";
+      } else {
+        $template .= <<'END';
+          my !!!output_var!!! = run_logic(!!!logic_name!!!, !!!wiring_in!!!);
+END
+      }
+    }
+    $template =~ s{!!!output_var!!!}{$output_var}g;
+    $template =~ s{!!!logic_name!!!}{'"' . quotemeta($logic_name) . '"'}ge;
+    $template =~ s{!!!wiring_in!!!}{$wiring_vars{$logic_name . ".in"}}ge;
+    $template .= gen_apply_nets($logic_name . ".out", $output_var);
+    $code .= $template;
   }
   return $code;
 }
@@ -340,10 +398,10 @@ sub gen_set_latches {
   my $code;
   for my $name (sort keys %registers) {
     my $template = <<'END';
-      $latches{!!!name!!!} = $wiring{!!!name_in!!!} & !!!mask!!!;
+      $latches{!!!name!!!} = !!!wiring_in!!! & !!!mask!!!;
 END
     $template =~ s{!!!name!!!}{'"' . quotemeta($name) . '"'}ge;
-    $template =~ s{!!!name_in!!!}{'"' . quotemeta($name . ".in") . '"'}ge;
+    $template =~ s{!!!wiring_in!!!}{$wiring_vars{$name . ".in"}}ge;
     $template =~ s{!!!mask!!!}{sprintf "0x%08x", $registers{$name}{mask}}ge;
     $code .= $template;
   }
@@ -353,12 +411,14 @@ END
 # TODO proper template function
 # does Sub::Quote have something?
 # even want something that abstracts $latches{!!!main!!!} so I can flip these to lexicals?
+# maybe using String::Tagged to mark holes and their parts-of-speech
 
 our $simulator;
 sub generate_simulator {
+  reset_generator();
+
   my %blocks = (
     setup_wiring => \&gen_setup_wiring,
-    apply_nets_prologue => \&gen_apply_nets_prologue,
     latches_to_wires => \&gen_latches_to_wires,
     run_wiring => \&gen_run_wiring,
     set_latches => \&gen_set_latches,
@@ -369,7 +429,6 @@ sub generate_simulator {
 
       # setup wiring for this simulation step
       !!!setup_wiring!!!
-      !!!apply_nets_prologue!!!
 
       # copy latch values into latch.out signals
       !!!latches_to_wires!!!
@@ -476,11 +535,7 @@ timed_log "Generated simulator";
 # Memory for write works as a latch, but for reading works like logic
 
 # TODO: simulate pull up on MAR._reset
-# TODO: declarative wiring (netlists)
-#       define_net(driver, driven)
-# also able to specify bit-ranges
 # TODO: generate Perl or C code (with use integer)
-# TODO: B::Concise,-exec dump of generated perl
 # TODO: pullups
 
 timed_log "Start of run\n";
@@ -496,7 +551,7 @@ reset_latch("R", 1);
 my $st_loop = time;
 die unless $t == 0;
 dump_state();
-while ($t < 100) {
+while ($t < 256) {
   local $max_tpd = 0;
   
   $simulator->();
