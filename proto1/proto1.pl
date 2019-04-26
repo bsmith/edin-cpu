@@ -395,6 +395,7 @@ reset_latch("P", 1);
 reset_latch("Q", 1);
 reset_latch("R", 1);
 
+my $st_loop = time;
 die unless $t == 0;
 dump_state();
 while ($t < 100) {
@@ -446,6 +447,7 @@ sub num2human {
 }
 
 my $et = time;
-timed_log sprintf "t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $ST), num2human($t / ($et - $ST));
+timed_log sprintf "loop  t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $st_loop), num2human($t / ($et - $st_loop));
+timed_log sprintf "total t=%s  elapsed=%s %s ticks/second\n", $t, num2human($et - $ST), num2human($t / ($et - $ST));
 
 timed_log "End of run\n";

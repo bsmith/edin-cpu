@@ -1,9 +1,12 @@
 #!/usr/bin/perl
 
 # proto1.pl reaches a performance of about 17 k ticks/second
+#   loop speed of about 26 k ticks/second
 # this version emits a compiled loop body - hopefully faster!
 # the first revision that kept loops in the body but inlined the four subs
-#   had a loop speed of about 29 k ticks/second, but a overall speed of 6 k
+#   had a loop speed of about 29 k ticks/second, but an overall speed of 6 k
+# second revision with logics and latches loops removed, but apply_nets kept
+#   had a loop speed of about 35 k ticks/second, but an overall speed of 3 k
 
 use 5.024;
 use strict;
@@ -14,6 +17,7 @@ use Cwd qw(getcwd);
 use String::ShellQuote qw(shell_quote_best_effort);
 use Carp qw(croak);
 use B::Concise ();
+use B::Deparse ();
 
 my $ST;
 BEGIN { $ST = time }
@@ -298,33 +302,57 @@ END
 }
 
 sub gen_latches_to_wires {
-  return <<'END';
-    for my $name (sort keys %registers) {
-      $apply_nets->($name . ".out", $latches{$name} & $registers{$name}{mask});
-    }
+  my $code;
+  for my $name (sort keys %registers) {
+    my $template = <<'END';
+      $apply_nets->(!!!name_out!!!, $latches{!!!name!!!} & !!!mask!!!);
 END
+    $template =~ s{!!!name!!!}{'"' . quotemeta($name) . '"'}ge;
+    $template =~ s{!!!name_out!!!}{'"' . quotemeta($name . ".out") . '"'}ge;
+    $template =~ s{!!!mask!!!}{sprintf "0x%08x", $registers{$name}{mask}}ge;
+    $code .= $template;
+  }
+  return $code;
 }
 
 sub gen_run_wiring {
-  return <<'END';
-    for my $logic_name (@logics_order) {
-      my $input = $wiring{$logic_name . ".in"};
-      if ($logics{$logic_name}{in_bits} == 0) {
-        $input = 0;
-      }
-      my $output = run_logic($logic_name, $input);
-      $apply_nets->($logic_name . ".out", $output);
+  my $code;
+  for my $logic_name (@logics_order) {
+    my $template = '';
+    if ($logics{$logic_name}{in_bits} == 0) {
+      $template .= q{ my $input = 0; } . "\n";
+    } else {
+      $template .= q{ my $input = $wiring{!!!name_in!!!}; } . "\n";
     }
+    $template .= <<'END';
+      my $output = run_logic(!!!name!!!, $input);
+      $apply_nets->(!!!name_out!!!, $output);
 END
+    $template =~ s{!!!name!!!}{'"' . quotemeta($logic_name) . '"'}ge;
+    $template =~ s{!!!name_in!!!}{'"' . quotemeta($logic_name . ".in") . '"'}ge;
+    $template =~ s{!!!name_out!!!}{'"' . quotemeta($logic_name . ".out") . '"'}ge;
+    $code .= "{\n" . $template . "}\n";
+  }
+  return $code;
 }
 
 sub gen_set_latches {
-  return <<'END';
-    for my $name (sort keys %registers) {
-      $latches{$name} = $wiring{$name . ".in"} & $registers{$name}{mask};
-    }
+  my $code;
+  for my $name (sort keys %registers) {
+    my $template = <<'END';
+      $latches{!!!name!!!} = $wiring{!!!name_in!!!} & !!!mask!!!;
 END
+    $template =~ s{!!!name!!!}{'"' . quotemeta($name) . '"'}ge;
+    $template =~ s{!!!name_in!!!}{'"' . quotemeta($name . ".in") . '"'}ge;
+    $template =~ s{!!!mask!!!}{sprintf "0x%08x", $registers{$name}{mask}}ge;
+    $code .= $template;
+  }
+  return $code;
 }
+
+# TODO proper template function
+# does Sub::Quote have something?
+# even want something that abstracts $latches{!!!main!!!} so I can flip these to lexicals?
 
 our $simulator;
 sub generate_simulator {
@@ -340,23 +368,25 @@ sub generate_simulator {
       use integer;
 
       # setup wiring for this simulation step
-      @@@setup_wiring@@@
-      @@@apply_nets_prologue@@@
+      !!!setup_wiring!!!
+      !!!apply_nets_prologue!!!
 
       # copy latch values into latch.out signals
-      @@@latches_to_wires@@@
+      !!!latches_to_wires!!!
 
       # use topo order to evaluate logic blocks
-      @@@run_wiring@@@
+      !!!run_wiring!!!
 
       # copy latch.in signals into latch state
       $t++;
-      @@@set_latches@@@
+      !!!set_latches!!!
+
+      return;
     }
 END
 
   # XXX magic to fix up indentation to copy indent of first line
-  $template =~ s{@@@([^@]+)@@@}{($blocks{$1} // sub { die "gen $1" })->()}ge;
+  $template =~ s{!!!([^!]+)!!!}{($blocks{$1} // sub { die "gen $1" })->()}ge;
 
   timed_log "Template for simulator";
   print $template;
@@ -370,6 +400,9 @@ END
 
   timed_log "Dump of simulator";
   B::Concise::compile("-exec", $simulator)->();
+
+  timed_log "Deparse of simulator";
+  print B::Deparse->new->coderef2text($simulator), "\n";
 
   return;
 }
