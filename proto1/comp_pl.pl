@@ -314,8 +314,9 @@ sub gen_setup_wiring {
   my $code = '';
   for my $driven_name (sort keys %driven_wires) {
     my $varname = $wiring_vars{$driven_name} = '$' . get_var($driven_name);
-    $code .= 'my ' . $varname . " = 0;\n";
+    $code .= 'my ' . $varname . " = \n";
   }
+  $code .= "  0;\n";
   return $code;
 }
 
@@ -548,15 +549,20 @@ reset_latch("P", 1);
 reset_latch("Q", 1);
 reset_latch("R", 1);
 
-my $st_loop = time;
-die unless $t == 0;
 dump_state();
-while ($t < 256) {
+
+my $MAX_T = 250_000;
+my $DUMP_INTERVAL = 1000;
+
+my $st_loop = time;
+my $not_okay = 0;
+die unless $t == 0;
+while ($t < $MAX_T) {
   local $max_tpd = 0;
   
   $simulator->();
   
-  dump_state();
+  dump_state() if ($t % $DUMP_INTERVAL) == 0;
 
   # checking
   if ($t > 0) {
@@ -565,12 +571,21 @@ while ($t < 256) {
     ($fib_a, $fib_b) = (1, 1) unless defined $fib_a and defined $fib_b;
     ($fib_a, $fib_b) = ($fib_b, ($fib_a + $fib_b) & 0xff);
     if ($fib_b == $r) {
-      print "check okay: $fib_b\n";
+      timed_log "check okay: $fib_b\n" if ($t % $DUMP_INTERVAL) == 0;
     } else {
-      print ">>> NOT OKAY: want: $fib_b;  got: $r <<<\n";
+      timed_log ">>> NOT OKAY: want: $fib_b;  got: $r <<<\n";
+      dump_state();
+      $not_okay++;
+      last if $not_okay > 100;
     }
   }
 }
+
+if ($not_okay > 0) {
+  timed_log ">>> RUN WAS NOT OKAY <<<\n";
+}
+
+dump_state();
 
 our %scale_suffices = (
   -15 => "femto", -12 => "pico", -9 => "nano", -6 => "micro", -3 => "milli",

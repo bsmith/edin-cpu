@@ -1,0 +1,3 @@
+put code into own repo!  have an idea how to do code gen.  func creates a bless ['Parentheses', expr_]; then that has a method "replace" that takes a ruleset as a parameter and matches itself against the ruleset.  something like that.  Then can create GeneratePerlCode and GenerateCCode.  Also using String::Tagged for templates so I don't have to describe the C overly much - I can just have templates of raw code for that bit.
+
+Mandelbrot!
